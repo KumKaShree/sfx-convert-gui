@@ -70,9 +70,8 @@ def _load_config() -> dict[str, str]:
     return {}
 
 
-def _save_config(key: str, value: str) -> None:
-    """Save a single config key to ini file."""
-    cfg = _load_config()
+def _save_config(cfg: dict[str, str], key: str, value: str) -> bool:
+    """Save a single config key to ini file. Returns True on success."""
     cfg[key] = value
     cfg_path = _get_config_path()
     try:
@@ -81,8 +80,9 @@ def _save_config(key: str, value: str) -> None:
             "\n".join(f"{k} = {v}" for k, v in cfg.items()),
             encoding="utf-8"
         )
+        return True
     except OSError:
-        pass
+        return False
 
 
 def _validate_ffmpeg(path: str) -> bool:
@@ -195,8 +195,8 @@ class ConverterApp:
         # Handle window close during conversion
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # Reload config when window gains focus (to pick up external changes)
-        self.root.bind("<FocusIn>", lambda _: self._reload_config())
+        # Reload config when window is deiconified (brought to front from minimized)
+        self.root.bind("<Map>", lambda _: self._reload_config())
 
     def _validate_ffmpeg_ui(self) -> None:
         """Validate FFmpeg availability and show status."""
@@ -216,8 +216,7 @@ class ConverterApp:
     def _on_ffmpeg_path_change(self) -> None:
         """Save custom FFmpeg path when user edits it and validate it."""
         path = self.ffmpeg_path_var.get().strip()
-        _save_config("ffmpeg_path", path)
-        self._config["ffmpeg_path"] = path
+        _save_config(self._config, "ffmpeg_path", path)
         if path:
             self._custom_ffmpeg_valid = _validate_ffmpeg(path)
             if not self._custom_ffmpeg_valid:
@@ -226,10 +225,10 @@ class ConverterApp:
             self._custom_ffmpeg_valid = None
 
     def _on_close(self) -> None:
-        """Handle window close - cancel conversion asynchronously and destroy."""
+        """Handle window close - cancel conversion and wait briefly before destroy."""
         if self._conversion_thread and self._conversion_thread.is_alive():
             self._cancel_flag.set()
-            # Don't block - let the daemon thread finish naturally on app destroy
+            self._conversion_thread.join(timeout=3)
         self.root.destroy()
 
     def _reload_config(self) -> None:
@@ -293,8 +292,7 @@ class ConverterApp:
         folder = filedialog.askdirectory()
         if folder:
             self.output_dir.set(folder)
-            _save_config("output_folder", folder)
-            self._config["output_folder"] = folder
+            _save_config(self._config, "output_folder", folder)
 
     def _get_ffmpeg_to_use(self) -> tuple[str, bool]:
         """Return (FFmpeg path, is_custom)."""
@@ -312,13 +310,11 @@ class ConverterApp:
             return
 
         if out_format != self._config.get("output_format", ""):
-            _save_config("output_format", out_format)
-            self._config["output_format"] = out_format
+            _save_config(self._config, "output_format", out_format)
 
         strip_ext = self.strip_ext_var.get()
         if (strip_ext and self._config.get("strip_extension") != "1") or (not strip_ext and self._config.get("strip_extension") == "1"):
-            _save_config("strip_extension", "1" if strip_ext else "0")
-            self._config["strip_extension"] = "1" if strip_ext else "0"
+            _save_config(self._config, "strip_extension", "1" if strip_ext else "0")
 
         output_dir = self.output_dir.get().strip()
         if not output_dir:
@@ -363,8 +359,10 @@ class ConverterApp:
         self.log("[Cancelled - will stop after current file]")
 
     def _convert_files(self, out_format: str, output_dir: str, ffmpeg_cmd: str, strip_ext: bool) -> None:
-        total = len(self.files)
-        for idx, file_path in enumerate(self.files):
+        # Snapshot files to avoid race with clear_files() during conversion
+        files_to_convert = list(self.files)
+        total = len(files_to_convert)
+        for idx, file_path in enumerate(files_to_convert):
             if self._cancel_flag.is_set():
                 self._schedule_log("--- Conversion Cancelled ---")
                 break
@@ -387,6 +385,7 @@ class ConverterApp:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
                     text=True,
+                    timeout=3600,
                 )
 
                 if self._cancel_flag.is_set():
@@ -403,6 +402,10 @@ class ConverterApp:
                         if line.strip():
                             self._schedule_log(f"    {line.strip()}")
 
+            except FileNotFoundError:
+                self._schedule_log(f"  Error: input file not found: {file_path}")
+            except PermissionError:
+                self._schedule_log(f"  Error: permission denied: {output_path}")
             except OSError as e:
                 self._schedule_log(f"  Error: {str(e)}")
 
