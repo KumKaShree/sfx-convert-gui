@@ -6,6 +6,8 @@ from pathlib import Path
 from tkinter import BooleanVar, END, Listbox, StringVar, filedialog, ttk, scrolledtext, messagebox
 from tkinter import Tk as tk_Tk
 
+_config_lock = threading.Lock()
+
 
 # ---------------------- CONFIG ----------------------
 def _find_ffmpeg() -> tuple[str, bool]:
@@ -71,18 +73,28 @@ def _load_config() -> dict[str, str]:
 
 
 def _save_config(cfg: dict[str, str], key: str, value: str) -> bool:
-    """Save a single config key to ini file. Returns True on success."""
-    cfg[key] = value
+    """Save a single config key to ini file. Returns True on success.
+
+    Uses a lock to prevent concurrent writes from multiple threads/processes.
+    Also reloads from disk before writing to avoid overwriting changes from
+    other instances that may have written since our last read.
+    """
     cfg_path = _get_config_path()
-    try:
-        cfg_path.parent.mkdir(parents=True, exist_ok=True)
-        cfg_path.write_text(
-            "\n".join(f"{k} = {v}" for k, v in cfg.items()),
-            encoding="utf-8"
-        )
-        return True
-    except OSError:
-        return False
+    with _config_lock:
+        # Reload to avoid overwriting concurrent changes from other instances
+        latest = _load_config()
+        latest[key] = value
+        try:
+            cfg_path.parent.mkdir(parents=True, exist_ok=True)
+            cfg_path.write_text(
+                "\n".join(f"{k} = {v}" for k, v in latest.items()),
+                encoding="utf-8"
+            )
+            cfg.clear()
+            cfg.update(latest)
+            return True
+        except OSError:
+            return False
 
 
 def _validate_ffmpeg(path: str) -> bool:
@@ -114,6 +126,7 @@ class ConverterApp:
         self._files_set: set[str] = set()  # O(1) duplicate lookup
         self._cancel_flag = threading.Event()
         self._conversion_thread: threading.Thread | None = None
+        self._current_process: subprocess.Popen | None = None
         self._max_log_lines = 500
         self._custom_ffmpeg_valid: bool | None = None
 
@@ -225,7 +238,13 @@ class ConverterApp:
             self._custom_ffmpeg_valid = None
 
     def _on_close(self) -> None:
-        """Handle window close - cancel conversion and wait briefly before destroy."""
+        """Handle window close - cancel conversion, kill subprocess, then destroy."""
+        if self._current_process is not None:
+            self._cancel_flag.set()
+            try:
+                self._current_process.kill()
+            except OSError:
+                pass
         if self._conversion_thread and self._conversion_thread.is_alive():
             self._cancel_flag.set()
             self._conversion_thread.join(timeout=3)
@@ -235,14 +254,24 @@ class ConverterApp:
         """Reload config from disk to pick up external changes."""
         new_config = _load_config()
         # Sync folder if changed externally
-        if new_config.get("output_folder") and new_config.get("output_folder") != self._config.get("output_folder"):
-            self.output_dir.set(new_config["output_folder"])
+        old_val = self._config.get("output_folder") or ""
+        new_val = new_config.get("output_folder") or ""
+        if new_val != old_val:
+            self.output_dir.set(new_config.get("output_folder", ""))
+        # Sync FFmpeg path if changed externally
+        old_ffmpeg = self._config.get("ffmpeg_path") or ""
+        new_ffmpeg = new_config.get("ffmpeg_path") or ""
+        if new_ffmpeg != old_ffmpeg:
+            self.ffmpeg_path_var.set(new_config.get("ffmpeg_path", ""))
+            self._custom_ffmpeg_valid = None
         # Sync format if changed externally
-        if new_config.get("output_format") and new_config.get("output_format") != self._config.get("output_format"):
+        old_fmt = self._config.get("output_format") or ""
+        new_fmt = new_config.get("output_format") or ""
+        if new_fmt != old_fmt:
             self.format_entry.delete(0, END)
-            self.format_entry.insert(0, new_config["output_format"])
+            self.format_entry.insert(0, new_config.get("output_format", ""))
         # Sync strip extension if changed externally
-        if new_config.get("strip_extension") != self._config.get("strip_extension"):
+        if (new_config.get("strip_extension") or "") != (self._config.get("strip_extension") or ""):
             self.strip_ext_var.set(new_config.get("strip_extension") == "1")
         self._config = new_config
 
@@ -325,11 +354,6 @@ class ConverterApp:
             messagebox.showwarning("Invalid folder", "Output folder does not exist or is not a directory.")
             return
 
-        # Check write permissions
-        if not os.access(output_dir, os.W_OK):
-            messagebox.showwarning("Permission denied", "Output folder is not writable.")
-            return
-
         ffmpeg_to_use, is_custom = self._get_ffmpeg_to_use()
         if is_custom:
             is_valid = self._custom_ffmpeg_valid if self._custom_ffmpeg_valid is not None else _validate_ffmpeg(ffmpeg_to_use)
@@ -380,22 +404,33 @@ class ConverterApp:
 
                 cmd = [ffmpeg_cmd, "-y", "-i", file_path, output_path]
 
-                result = subprocess.run(
+                proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
                     text=True,
-                    timeout=3600,
                 )
+                self._current_process = proc
+
+                try:
+                    stderr_output, _ = proc.communicate(timeout=3600)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.communicate()
+                    self._schedule_log(f"  Error: FFmpeg timed out after 3600s: {file_path}")
+                    self._current_process = None
+                    continue
+                finally:
+                    self._current_process = None
 
                 if self._cancel_flag.is_set():
                     self._schedule_log("--- Conversion Cancelled ---")
                     break
 
-                if result.returncode == 0:
+                if proc.returncode == 0:
                     self._schedule_log(f"  Success: {output_path}")
                 else:
-                    error_msg = result.stderr.strip().splitlines()
+                    error_msg = stderr_output.strip().splitlines()
                     self._schedule_log(f"  Failed: {file_path}")
                     # Show last 5 lines of error
                     for line in error_msg[-5:]:
